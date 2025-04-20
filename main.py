@@ -316,24 +316,22 @@ async def handle_unban_command(message: Message):
         await message.reply(f"⚠️ User <code>{user_id_to_unban}</code> was not found in the block list or an error occurred.")
 
 async def on_startup(bot: Bot):
-    webhook_info = await bot.get_webhook_info()
-    if webhook_info.url != WEBHOOK_URL:
-        if not BASE_WEBHOOK_URL or BASE_WEBHOOK_URL == "YOUR_FALLBACK_HTTPS_URL":
-             logging.warning("Skipping webhook setup because BASE_WEBHOOK_URL is not configured correctly.")
-             return
 
-        logging.info(f"Setting webhook to {WEBHOOK_URL}")
-        try:
-            await bot.set_webhook(
-                url=WEBHOOK_URL,
-                secret_token=WEBHOOK_SECRET,
-                drop_pending_updates=True
-            )
-            logging.info(f"Webhook set successfully to {WEBHOOK_URL}")
-        except Exception as e:
-            logging.error(f"Failed to set webhook {WEBHOOK_URL}: {e}")
-    else:
-        logging.info(f"Webhook already set to {WEBHOOK_URL}")
+    if not BASE_WEBHOOK_URL or BASE_WEBHOOK_URL == "YOUR_FALLBACK_HTTPS_URL":
+            logging.warning("Skipping webhook setup because BASE_WEBHOOK_URL is not configured correctly.")
+            return 
+
+    logging.info(f"Attempting to set/reset webhook to {WEBHOOK_URL}")
+    try:
+        await bot.set_webhook(
+            url=WEBHOOK_URL,
+            secret_token=WEBHOOK_SECRET, 
+            drop_pending_updates=True
+        )
+ 
+        logging.info(f"Webhook set/reset successfully attempted for {WEBHOOK_URL}")
+    except Exception as e:
+        logging.error(f"Failed to set/reset webhook {WEBHOOK_URL}: {e}")
 
 async def on_shutdown(bot: Bot):
     logging.info("Shutting down.. removing webhook")
