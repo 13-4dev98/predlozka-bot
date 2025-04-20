@@ -3,11 +3,10 @@ import asyncio
 import platform
 import logging
 import os
+import re
 
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.filters import CommandStart, Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramAPIError, TelegramBadRequest
@@ -61,11 +60,16 @@ WEBHOOK_URL = f"{BASE_WEBHOOK_URL}{WEBHOOK_PATH}"
 WEB_SERVER_HOST = "0.0.0.0"
 WEB_SERVER_PORT = int(os.getenv('PORT', 8080))
 
-class AdminReply(StatesGroup):
-    awaiting_reply_text = State()
-    target_user_id = State()
-
 router = Router()
+
+def extract_user_id_from_prompt(text: str) -> int | None:
+    match = re.search(r"User ID: <code>(\d+)</code>", text)
+    if match:
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+    return None
 
 @router.message(CommandStart())
 async def handle_start(message: Message):
@@ -78,13 +82,13 @@ async def handle_start(message: Message):
         try:
             await message.answer(
                 "Hello, Admin! 👋\n"
-                "You can manage suggestions.\n"
-                "Use /unban <code>user_id</code> to unblock a user."
+                "You can manage suggestions in the moderation group.\n"
+                "Use /unban <code>user_id</code> to unblock a user (in PM with the bot)."
             )
         except TelegramBadRequest as e:
              logging.error(f"Failed to send start message to admin {user_id} with HTML: {e}")
              await message.answer(
-                 "Hello, Admin! You can manage suggestions. Use /unban user_id to unblock a user."
+                 "Hello, Admin! You can manage suggestions in the moderation group. Use /unban user_id to unblock a user (in PM with the bot)."
              )
     else:
         await message.answer(
@@ -154,13 +158,20 @@ async def handle_suggestion(message: Message, bot: Bot):
     if sent_to_group:
         await message.reply("Thank you! Your suggestion has been sent to the administration.")
 
+
 @router.callback_query(F.data.startswith("reply_") | F.data.startswith("block_"))
-async def handle_admin_action(callback: CallbackQuery, state: FSMContext, bot: Bot):
-    admin_id = callback.from_user.id
+async def handle_admin_action(callback: CallbackQuery, bot: Bot):
+    admin_user = callback.from_user
+    admin_id = admin_user.id
 
     if admin_id not in ADMIN_IDS:
         await callback.answer("This action is only available to administrators.", show_alert=True)
         return
+
+    if callback.message and callback.message.chat.id != TARGET_GROUP_ID:
+         await callback.answer("Please perform this action in the moderation group.", show_alert=True)
+         logging.warning(f"Admin {admin_id} tried action '{callback.data}' outside moderation group ({callback.message.chat.id})")
+         return
 
     action, user_id_str = callback.data.split("_", 1)
     try:
@@ -169,7 +180,7 @@ async def handle_admin_action(callback: CallbackQuery, state: FSMContext, bot: B
         await callback.answer("Error: Invalid user ID.", show_alert=True)
         return
 
-    logging.info(f"[Admin Action] Admin: {admin_id}, Action: {action}, Target User: {user_id} in Chat: {callback.message.chat.id}")
+    logging.info(f"[Admin Action] Admin: {admin_id}, Action: {action}, Target User: {user_id} in Group: {TARGET_GROUP_ID}")
 
     if action == "block":
         await block_user(user_id)
@@ -188,14 +199,14 @@ async def handle_admin_action(callback: CallbackQuery, state: FSMContext, bot: B
 
                 if callback.message.photo:
                      await bot.edit_message_caption(
-                         chat_id=callback.message.chat.id,
+                         chat_id=TARGET_GROUP_ID,
                          message_id=callback.message.message_id,
                          caption=new_text,
                          reply_markup=unban_keyboard
                      )
                 else:
                     await callback.message.edit_text(
-                        chat_id=callback.message.chat.id,
+                        chat_id=TARGET_GROUP_ID,
                         message_id=callback.message.message_id,
                         text=new_text,
                         reply_markup=unban_keyboard
@@ -203,27 +214,109 @@ async def handle_admin_action(callback: CallbackQuery, state: FSMContext, bot: B
             else:
                  logging.warning("Could not get callback.message to edit after blocking.")
         except TelegramAPIError as e:
-             logging.warning(f"Could not edit message in group {callback.message.chat.id} after blocking user {user_id}: {e}")
+             logging.warning(f"Could not edit message in group {TARGET_GROUP_ID} after blocking user {user_id}: {e}")
 
     elif action == "reply":
-        await state.set_state(AdminReply.awaiting_reply_text)
-        await state.update_data(target_user_id=user_id)
-        logging.info(f"[Admin Action] State set to AdminReply.awaiting_reply_text for target_user_id: {user_id}")
-
-        await callback.answer("Enter the reply text:")
+        prompt_text = (
+            f"{admin_user.mention_html()}, please send your reply for User ID: <code>{user_id}</code> "
+            f"**by replying to this message**."
+        )
+        prompt_keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Cancel Reply", callback_data=f"cancel_prompt_{user_id}_{admin_id}")]
+        ])
         try:
             await bot.send_message(
-                chat_id=admin_id,
-                text=f"Please enter your reply for user ID: <code>{user_id}</code>\n"
-                     f"Send /cancel to abort."
+                chat_id=TARGET_GROUP_ID,
+                text=prompt_text,
+                reply_markup=prompt_keyboard
             )
-            logging.info(f"[Admin Action] Reply prompt sent to admin {admin_id} (in PM) for user {user_id}")
-        except TelegramBadRequest as e:
-             logging.error(f"Failed to send reply prompt to admin {admin_id} with HTML: {e}")
-             await bot.send_message(
-                 chat_id=admin_id,
-                 text=f"Please enter your reply for user ID: {user_id}\nSend /cancel to abort."
-             )
+            await callback.answer("Please reply to the new message sent in the group.")
+            logging.info(f"Sent reply prompt to group {TARGET_GROUP_ID} for admin {admin_id} replying to {user_id}")
+        except TelegramAPIError as e:
+            logging.error(f"Failed to send reply prompt to group {TARGET_GROUP_ID}: {e}")
+            await callback.answer("Error: Could not send reply prompt.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("cancel_prompt_"))
+async def handle_cancel_prompt(callback: CallbackQuery, bot: Bot):
+    try:
+        parts = callback.data.split("_")
+        target_user_id = int(parts[2])
+        prompting_admin_id = int(parts[3])
+    except (IndexError, ValueError):
+        await callback.answer("Error processing cancel request.", show_alert=True)
+        logging.error(f"Could not parse cancel_prompt callback data: {callback.data}")
+        return
+
+    if callback.from_user.id != prompting_admin_id:
+        await callback.answer("Only the admin who initiated the reply can cancel it.", show_alert=True)
+        return
+
+    try:
+        await bot.delete_message(chat_id=callback.message.chat.id, message_id=callback.message.message_id)
+        await callback.answer("Reply cancelled.")
+        logging.info(f"Admin {callback.from_user.id} cancelled reply prompt for user {target_user_id}")
+    except TelegramAPIError as e:
+        logging.error(f"Failed to delete reply prompt message {callback.message.message_id}: {e}")
+        await callback.answer("Could not delete the prompt message, but reply is cancelled.", show_alert=True)
+
+
+@router.message(
+    F.chat.id == TARGET_GROUP_ID,
+    F.from_user.id.in_(ADMIN_IDS),
+    F.reply_to_message,
+    F.reply_to_message.from_user.is_bot,
+    F.text
+)
+async def handle_group_reply_to_bot(message: Message, bot: Bot):
+    bot_info = await bot.get_me()
+    if message.reply_to_message.from_user.id != bot_info.id:
+         return
+
+    prompt_text = message.reply_to_message.text
+    admin_reply_text = message.text
+    admin_user = message.from_user
+
+    target_user_id = extract_user_id_from_prompt(prompt_text)
+
+    if target_user_id is None:
+        logging.warning(f"Admin {admin_user.id} replied to bot message in group {TARGET_GROUP_ID}, but target_user_id not found in prompt: '{prompt_text}'")
+        return
+
+    if admin_user.mention_html() not in prompt_text and (admin_user.username and f"@{admin_user.username}" not in prompt_text):
+         logging.warning(f"Admin {admin_user.id} replied to prompt intended for another admin. Prompt: '{prompt_text}'. Ignoring.")
+         await message.reply("This reply prompt wasn't for you.", disable_notification=True)
+         return
+
+    logging.info(f"Processing group reply from Admin {admin_user.id} to User {target_user_id}")
+
+    try:
+        await bot.send_message(
+            chat_id=target_user_id,
+            text=f"ℹ️ Reply from Administration:\n\n{admin_reply_text}"
+        )
+        logging.info(f"[Group Reply] SUCCESS: Admin {admin_user.id} replied to user {target_user_id}")
+
+        try:
+            await message.reply(f"✅ Reply sent to user <code>{target_user_id}</code>.", disable_notification=True)
+            await bot.delete_message(
+                 chat_id=message.chat.id,
+                 message_id=message.reply_to_message.message_id
+            )
+        except TelegramAPIError as cleanup_err:
+             logging.warning(f"Error during cleanup after group reply by {admin_user.id}: {cleanup_err}")
+
+    except TelegramAPIError as e:
+        logging.error(f"[Group Reply] FAILED to send reply to user {target_user_id}: {e}")
+        await message.reply(
+            f"⚠️ Could not send reply to user <code>{target_user_id}</code>. "
+            f"They might have blocked the bot, or the ID might be invalid."
+            f"\nError details: {e}"
+        )
+    except Exception as e:
+        logging.exception(f"[Group Reply] UNKNOWN error sending reply to user {target_user_id}")
+        await message.reply("An unexpected error occurred while sending the reply.")
+
 
 @router.callback_query(F.data.startswith("unban_"))
 async def handle_unban_button(callback: CallbackQuery, bot: Bot):
@@ -233,6 +326,10 @@ async def handle_unban_button(callback: CallbackQuery, bot: Bot):
         await callback.answer("This action is only available to administrators.", show_alert=True)
         return
 
+    if callback.message and callback.message.chat.id != TARGET_GROUP_ID:
+         await callback.answer("Please perform this action in the moderation group.", show_alert=True)
+         return
+
     _, user_id_str = callback.data.split("_", 1)
     try:
         user_id = int(user_id_str)
@@ -240,7 +337,7 @@ async def handle_unban_button(callback: CallbackQuery, bot: Bot):
         await callback.answer("Error: Invalid user ID.", show_alert=True)
         return
 
-    logging.info(f"[Unban Action] Admin: {admin_id} initiated unban via button for User: {user_id} in Chat: {callback.message.chat.id}")
+    logging.info(f"[Unban Action] Admin: {admin_id} initiated unban via button for User: {user_id} in Group: {TARGET_GROUP_ID}")
 
     if await unban_user(user_id):
         await callback.answer(f"User {user_id} has been unblocked.", show_alert=True)
@@ -257,75 +354,32 @@ async def handle_unban_button(callback: CallbackQuery, bot: Bot):
 
                  if callback.message.photo:
                      await bot.edit_message_caption(
-                         chat_id=callback.message.chat.id,
+                         chat_id=TARGET_GROUP_ID,
                          message_id=callback.message.message_id,
                          caption=new_text,
                          reply_markup=keyboard
                      )
                  else:
                     await callback.message.edit_text(
-                        chat_id=callback.message.chat.id,
+                        chat_id=TARGET_GROUP_ID,
                         message_id=callback.message.message_id,
                         text=new_text,
                         reply_markup=keyboard
                     )
         except TelegramAPIError as e:
-            logging.warning(f"Could not edit message in group {callback.message.chat.id} after unblocking user {user_id} via button: {e}")
+            logging.warning(f"Could not edit message in group {TARGET_GROUP_ID} after unblocking user {user_id} via button: {e}")
     else:
         await callback.answer(f"User {user_id} was not found in the block list or could not be unblocked.", show_alert=True)
 
-@router.message(Command("cancel"), AdminReply.awaiting_reply_text)
-async def cancel_reply_state(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state is None:
-        return
-    logging.info(f"Cancelling state {current_state} for admin {message.from_user.id}")
-    await state.clear()
-    await message.answer("Action cancelled. You are no longer in reply mode.")
-
-@router.message(AdminReply.awaiting_reply_text, F.text)
-async def process_admin_reply(message: Message, state: FSMContext, bot: Bot):
-    admin_reply_text = message.text
-    admin_id = message.from_user.id
-    logging.info(f"[Process Reply] Received reply text from admin {admin_id} while in state.")
-
-    data = await state.get_data()
-    target_user_id = data.get('target_user_id')
-    logging.info(f"[Process Reply] Retrieved state data: {data}")
-
-    await state.clear()
-    logging.info(f"[Process Reply] State cleared for admin {admin_id}.")
-
-    if not target_user_id:
-        logging.warning(f"[Process Reply] target_user_id not found in state for admin {admin_id}.")
-        await message.reply("Error: Target user ID not found. Please click 'Reply' on the desired suggestion again.")
-        return
-
-    logging.info(f"[Process Reply] Attempting to send reply from admin {admin_id} to target_user_id {target_user_id}")
-
-    try:
-        await bot.send_message(
-            chat_id=target_user_id,
-            text=f"ℹ️ Reply from Administration:\n\n{admin_reply_text}"
-        )
-        await message.reply(f"✅ Reply successfully sent to user <code>{target_user_id}</code>.")
-        logging.info(f"[Process Reply] SUCCESS: Admin {admin_id} replied to user {target_user_id}")
-
-    except TelegramAPIError as e:
-        logging.error(f"[Process Reply] FAILED to send reply to user {target_user_id}: {e}")
-        await message.reply(
-            f"⚠️ Could not send reply to user <code>{target_user_id}</code>. "
-            f"They might have blocked the bot, or the ID might be invalid."
-            f"\nError details: {e}"
-        )
-    except Exception as e:
-        logging.exception(f"[Process Reply] UNKNOWN error sending reply to user {target_user_id}")
-        await message.reply("An unexpected error occurred while sending the reply.")
 
 @router.message(Command("unban"))
 async def handle_unban_command(message: Message):
     admin_id = message.from_user.id
     if admin_id not in ADMIN_IDS:
+        return
+
+    if message.chat.id != admin_id:
+        await message.reply("Please use the /unban command in a private chat with me.")
         return
 
     command_parts = message.text.split()
@@ -339,7 +393,7 @@ async def handle_unban_command(message: Message):
         await message.reply("Invalid User ID. Please provide a number.")
         return
 
-    logging.info(f"[Unban Command] Admin: {admin_id} trying to unban User: {user_id_to_unban} via command")
+    logging.info(f"[Unban Command] Admin: {admin_id} trying to unban User: {user_id_to_unban} via command in PM")
 
     if await unban_user(user_id_to_unban):
         await message.reply(f"✅ User <code>{user_id_to_unban}</code> has been unblocked.")
@@ -357,6 +411,7 @@ async def on_startup(bot: Bot):
             url=WEBHOOK_URL,
             secret_token=WEBHOOK_SECRET,
             drop_pending_updates=True,
+            allowed_updates=['message', 'callback_query']
         )
         logging.info(f"Webhook set/reset successfully attempted for {WEBHOOK_URL}")
 
@@ -385,6 +440,7 @@ async def on_shutdown(bot: Bot):
     await bot.session.close()
     logging.info("Bot session closed.")
 
+
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -397,11 +453,14 @@ async def main():
        sys.exit(1)
     if not TARGET_GROUP_ID:
         logging.critical("MODERATION_GROUP_ID is not configured. Bot cannot forward suggestions.")
+        # sys.exit(1) # Uncomment if group is mandatory
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS is not configured. No one can manage suggestions.")
+        # sys.exit(1) # Uncomment if admins are mandatory
     if not BASE_WEBHOOK_URL or BASE_WEBHOOK_URL == "YOUR_FALLBACK_HTTPS_URL":
         logging.critical("RENDER_EXTERNAL_URL environment variable not found or fallback URL not set!")
         logging.warning("Cannot set webhook without a valid BASE_WEBHOOK_URL. Bot might not receive updates if webhook isn't set manually.")
+        # sys.exit(1) # Uncomment if webhook is mandatory
 
     await init_db()
 
@@ -432,6 +491,7 @@ async def main():
     await site.start()
 
     await asyncio.Event().wait()
+
 
 if __name__ == "__main__":
     try:
