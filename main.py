@@ -121,7 +121,6 @@ async def edit_original_message_status(bot: Bot, chat_id: int, message_id: int, 
 
 @router.message(CommandStart())
 async def handle_start(message: Message):
-    logging.info(f"=== Received /start from user {message.from_user.id} ===") # --- test
     user_id = message.from_user.id
     if await is_user_blocked(user_id):
         await message.answer("Sorry, you have been blocked and cannot send suggestions.")
