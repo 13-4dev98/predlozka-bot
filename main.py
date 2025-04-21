@@ -502,7 +502,6 @@ async def on_shutdown(bot: Bot):
     logging.info("Shutting down.. removing webhook")
     if TARGET_GROUP_ID:
         try:
-             # Clear any pending reply states on shutdown? Maybe not necessary.
              await bot.send_message(TARGET_GROUP_ID, "💤 Bot is stopping...")
         except Exception as e:
              logging.warning(f"Could not send shutdown message to group {TARGET_GROUP_ID}: {e}")
@@ -515,6 +514,9 @@ async def on_shutdown(bot: Bot):
     await bot.session.close()
     logging.info("Bot session closed.")
 
+async def ping_handler(request):
+    return web.Response(text="OK", status=200)
+
 async def main():
     logging.basicConfig(
         level=logging.INFO,
@@ -523,18 +525,16 @@ async def main():
     logging.info("Starting bot in webhook mode...")
 
     if not BOT_TOKEN or BOT_TOKEN == "YOUR_FALLBACK_BOT_TOKEN":
-       logging.critical("BOT_TOKEN environment variable not set or is fallback!")
-       sys.exit(1)
+        logging.critical("BOT_TOKEN environment variable not set or is fallback!")
+        sys.exit(1)
     if not TARGET_GROUP_ID:
         logging.critical("MODERATION_GROUP_ID is not configured. Bot cannot forward suggestions.")
-        sys.exit(1) # Exit if group is mandatory
+        sys.exit(1)
     if not ADMIN_IDS:
         logging.warning("ADMIN_IDS is not configured. No one can manage suggestions.")
-        # Decide if bot should run without admins
     if not BASE_WEBHOOK_URL or BASE_WEBHOOK_URL == "YOUR_FALLBACK_HTTPS_URL":
         logging.critical("RENDER_EXTERNAL_URL environment variable not found or fallback URL not set!")
-        logging.warning("Cannot set webhook without a valid BASE_WEBHOOK_URL. Bot might not receive updates if webhook isn't set manually.")
-        # Decide if webhook is mandatory
+        logging.warning("Cannot set webhook without a valid BASE_WEBHOOK_URL.")
 
     await init_db()
 
@@ -555,6 +555,9 @@ async def main():
         secret_token=WEBHOOK_SECRET,
     )
     webhook_requests_handler.register(app, path=WEBHOOK_PATH)
+    
+    app.router.add_get('/ping', ping_handler)
+
     setup_application(app, dp, bot=bot)
 
     runner = web.AppRunner(app)
